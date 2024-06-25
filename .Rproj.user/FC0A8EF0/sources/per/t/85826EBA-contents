@@ -1,0 +1,159 @@
+# Load required libraries
+library(caret)
+library(dplyr)
+library(readr)
+library(skimr)
+library(ggplot2)
+library(pROC)
+library(e1071)  # For SVM
+library(xgboost)
+library(randomForest)
+
+# Read in data and encode the categorical variable correctly
+data <- read_csv("Customer Churn.csv", 
+                 col_types = cols(
+                   Complains = col_factor(levels = c("0", "1")), 
+                   `Charge Amount` = col_factor(levels = c("0", "1", "2", "3", "4", "5", "6", "7", "8", "9")), 
+                   `Age Group` = col_factor(levels = c("1", "2", "3", "4", "5")), 
+                   `Tariff Plan` = col_factor(levels = c("1", "2")), 
+                   Status = col_factor(levels = c("1", "2")), 
+                   Churn = col_factor(levels = c("0", "1"))
+                 )
+)
+
+# Rename columns with spaces
+colnames(data) <- gsub("\\s+", "_", colnames(data))
+
+# Checking for missing data
+cat("Number of missing values:", sum(is.na(data)), "\n")
+
+# Handling missing data in Charge_Amount
+missing_values <- sum(is.na(data$Charge_Amount))
+if (missing_values > 0) {
+  mode_charge_amount <- as.character(table(data$Charge_Amount)[which.max(table(data$Charge_Amount))])
+  data$Charge_Amount[is.na(data$Charge_Amount)] <- mode_charge_amount
+  data$Charge_Amount <- factor(data$Charge_Amount, levels = c("0", "1", "2", "3", "4", "5", "6", "7", "8", "9"))
+}
+
+# Summary statistics and visualization
+summary(data)
+skim(data)
+
+# Visualize distribution of the target variable (Churn)
+ggplot(data, aes(x = factor(Churn))) +
+  geom_bar() +
+  geom_text(stat = 'count', aes(label = ..count..), vjust = -0.5) +
+  labs(title = "Churn Distribution", x = "Churn", y = "Count") +
+  scale_x_discrete(labels = c("Non-Churn", "Churn"))
+
+# Visualize distribution of categorical variables
+categorical_vars <- c("Complains", "Charge_Amount", "Age_Group", "Tariff_Plan", "Status")
+data_long <- tidyr::gather(data, key = "Variable", value = "Value", all_of(categorical_vars))
+ggplot(data_long, aes(x = factor(Value))) +
+  geom_bar() +
+  facet_wrap(~Variable, scales = "free_x", ncol = 2) +
+  labs(title = "Distribution of Categorical Variables")
+
+# Visualize the distribution of numerical features
+numeric_vars <- c("Call_Failure", "Subscription_Length", "Seconds_of_Use", "Frequency_of_use",
+                  "Frequency_of_SMS", "Distinct_Called_Numbers", "Customer_Value")
+
+par(mfrow = c(2, 4))
+for (var in numeric_vars) {
+  boxplot(data[[var]], main = var)
+}
+
+# Check correlation matrix
+correlation_matrix <- cor(data[numeric_vars])
+correlation_df <- as.data.frame(as.table(correlation_matrix))
+
+# Plot the heatmap with correlation values
+ggplot(data = correlation_df, aes(x = Var1, y = Var2, fill = Freq)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(Freq, 2)), vjust = 1) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1))
+
+# Checking and transforming skewness of numerical variables
+data_numerical <- data[, numeric_vars]
+skewness_before <- sapply(data_numerical, skewness)
+
+print("Skewness before transformation:")
+print(skewness_before)
+
+# Apply log transformation to correct skewness
+for (var in numeric_vars) {
+  if (skewness_before[var] > 1) {
+    data_numerical[[var]] <- log1p(data_numerical[[var]])
+  }
+}
+
+# Check skewness after transformation
+skewness_after <- sapply(data_numerical, skewness)
+print("Skewness after transformation:")
+print(skewness_after)
+
+# Merge with categorical variables
+df_merged <- cbind(data[, setdiff(names(data), numeric_vars)], data_numerical)
+
+# Model building
+
+# Split the data into training and testing sets
+set.seed(123)  # for reproducibility
+train_index <- createDataPartition(df_merged$Churn, p = 0.7, list = FALSE)
+train_data <- df_merged[train_index, ]
+test_data <- df_merged[-train_index, ]
+
+# Convert Churn to factor
+train_data$Churn <- as.factor(train_data$Churn)
+test_data$Churn <- as.factor(test_data$Churn)
+
+# Train a logistic regression model
+log_reg_model <- glm(Churn ~ ., data = train_data, family = "binomial")
+log_reg_predictions <- predict(log_reg_model, newdata = test_data, type = "response")
+log_reg_predicted_classes <- ifelse(log_reg_predictions > 0.5, 1, 0)
+log_reg_predicted_classes <- factor(log_reg_predicted_classes, levels = levels(test_data$Churn))
+
+# Train an SVM model
+svm_model <- svm(Churn ~ ., data = train_data)
+svm_predictions <- predict(svm_model, newdata = test_data)
+svm_predictions <- factor(svm_predictions, levels = levels(test_data$Churn))
+
+# Train a Random Forest model
+rf_model <- randomForest(Churn ~ ., data = train_data)
+rf_predictions <- predict(rf_model, newdata = test_data)
+rf_predictions <- factor(rf_predictions, levels = levels(test_data$Churn))
+
+# Evaluate models and plot ROC curves
+models <- list(
+  Logistic_Regression = log_reg_predicted_classes,
+  SVM = svm_predictions,
+  Random_Forest = rf_predictions
+)
+
+roc_curve_plots <- lapply(models, function(predictions, model_name) {
+  roc_curve <- roc(test_data$Churn, as.numeric(predictions))
+  auc_value <- auc(roc_curve)
+  
+  ggroc(roc_curve, legacy.axes = TRUE, legacy.layout = TRUE) +
+    labs(title = paste(model_name, "ROC Curve"), subtitle = paste("AUC =", round(auc_value, 3)))
+})
+
+# Combine ROC curves into one plot
+gridExtra::grid.arrange(grobs = roc_curve_plots, ncol = 3)
+
+# Display the results data frame
+model_results <- data.frame(
+  Model = character(0),
+  Accuracy = numeric(0),
+  Precision = numeric(0),
+  Recall = numeric(0),
+  ROC_AUC = numeric(0)
+)
+
+# Evaluate and populate the data frame
+evaluate_model <- function(predictions, model_name) {
+  cm <- confusionMatrix(predictions, test_data$Churn)
+  roc_curve
+}
+  
